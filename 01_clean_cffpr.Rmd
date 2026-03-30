@@ -1,0 +1,154 @@
+---
+title: "Assignment 1"
+author: "Enya Liu"
+date: "2025-03-24"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(tidyverse)
+```
+
+```{r}
+# read datasets
+registry <- read.csv("C:/Users/umi/Downloads/registry_deID.csv")
+```
+
+# Task 1 Creating a summarizing registry dataset
+## Check for participants who did not prescirbe any modulator
+```{r}
+# process the registry dataset first
+# replace NA with 0
+registry[is.na(registry)] <- 0
+no_registry <- registry %>%
+  group_by(newID) %>%
+  summarise(Vx770 = mean(Vx770), Vx809 = mean(Vx809comb), vx661 = mean(vx661comb), vx445 = mean(vx445comb))
+
+no_registry$is_all_zero <- rowSums(no_registry[, c("Vx770", "Vx809", "vx661", "vx445")] == 0) == 4
+```
+
+```{r}
+# check for columns and convert them into a single group column with encounter or prescription groups
+edited_registry <- registry %>%
+  mutate(
+    group = ifelse(
+      rowSums(select(., Vx770, Vx809comb, vx661comb, vx445comb)) == 0,
+      "encounter",
+      apply(select(., Vx770, Vx809comb, vx661comb, vx445comb), 1, 
+            function(row){paste(names(which(row == 1)), collapse = ", ")})
+    )
+  )
+
+# if one date has multiple prescriptions, separate them into separate rows
+edited_registry <- edited_registry %>% separate_rows(group, sep = ", ")
+
+# keep encounter date as a separate dataframe and compare it to the edited registry data later
+encounter_registry <- edited_registry[edited_registry$group=="encounter",]
+encounter_registry <- encounter_registry %>%
+  group_by(newID) %>%
+# [MCM Comment] The issue begins here. You are defining the first/final encounter dates using
+# only dates during which participants were not prescribed a modulator. What if the participant
+# was on a modulator at the time of the first/last registry entry?
+  summarise(first_enc_date = min(stdyrs),
+    final_enc_date = max(stdyrs))
+
+edited_registry <- edited_registry[!edited_registry$group=="encounter",]
+
+# group by ID and prescription group and find the earliest and latest prescribed date
+edited_registry <- edited_registry %>%
+  group_by(newID, group) %>%
+  summarise(start_date = min(stdyrs),
+    stop_date = max(stdyrs))
+
+# add encounter date back by full join
+final_registry_data <- edited_registry %>%
+  full_join(encounter_registry, by = c("newID" = "newID"))
+
+# if no prescription
+final_registry_data <- final_registry_data %>%
+  mutate(
+    start_date = if_else(is.na(start_date), 0, start_date),
+    stop_date = if_else(is.na(stop_date), 0, stop_date)
+  )
+
+
+# check if stop date > final enc date
+final_registry_data$final_enc_date <- ifelse(final_registry_data$stop_date > final_registry_data$final_enc_date, 
+                                             final_registry_data$stop_date, final_registry_data$final_enc_date)
+
+# Use the latest encounter date for each participant
+final_registry_data <- final_registry_data %>%
+  group_by(newID) %>%
+  mutate(final_enc_date = max(final_enc_date)) %>%
+  ungroup()
+
+# replace vx groups with prescribe names
+final_registry_data <- final_registry_data %>%
+  mutate(group = recode(group,
+                         "Vx770" = "Ivacaftor",
+                         "Vx809comb" = "Lumacaftor/Ivacaftor",
+                         "vx661comb" = "Tezacaftor/Ivacaftor",
+                        "vx445comb" = "Elexacafot/Tezacaftor/Ivacaftor"))
+```
+
+# Task 2 Create an indicator variable status
+```{r}
+final_registry_data$status <- ifelse(final_registry_data$stop_date == final_registry_data$final_enc_date, 0, 1)
+# show result
+final_registry_data
+```
+
+# Task 3 Save the dataset as CHEC_tx_dates.csv
+```{r}
+write.csv(final_registry_data, "CHEC_tx_dates.csv")
+```
+The processed registry data was saved as CHEC_tx_dates.csv to the working directory. 
+
+# Task 4 Histogram Visualisation 
+```{r}
+histogram_data <- final_registry_data %>% group_by(group, newID) %>%
+  summarise(value = abs(start_date-final_enc_date))
+
+# Compute summary statistics by group
+summary_stats <- histogram_data %>%
+  group_by(group) %>%
+  summarize(
+    mean = mean(value, na.rm = T),
+    min = min(value, na.rm = T),
+    q1 = quantile(value, 0.25, na.rm = T),
+    median = median(value, na.rm = T),
+    q3 = quantile(value, 0.75, na.rm = T),
+    max = max(value, na.rm = T)
+  ) %>%
+  tidyr::pivot_longer(cols = -group, names_to = "stat", values_to = "xintercept")
+
+ggplot(histogram_data, aes(x = value, fill = group)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 30) +
+  facet_wrap(~group) +
+  labs(title = "Histogram Stratified by Group", x = "Value", y = "Count") +
+  geom_vline(data = summary_stats, aes(xintercept = xintercept, color = stat))
+```
+# Task 5 Number of Participants Prescribed CFTR Modulator
+```{r}
+cftr_participants <- final_registry_data %>%
+  group_by(group) %>%
+  summarise(n_distinct(newID))
+cftr_participants
+```
+# Task 6 Number of CFTR Modulators Prescribed
+```{r}
+final_registry_data <- final_registry_data[!is.na(final_registry_data$group),]
+num_CFTR <- final_registry_data %>%
+  group_by(newID) %>%
+  summarise(n_distinct(group))
+count(num_CFTR[num_CFTR$`n_distinct(group)`== 1,])
+count(num_CFTR[num_CFTR$`n_distinct(group)`== 2,])
+count(num_CFTR[num_CFTR$`n_distinct(group)`== 3,])
+count(num_CFTR[num_CFTR$`n_distinct(group)`== 4,])
+```
+
+
