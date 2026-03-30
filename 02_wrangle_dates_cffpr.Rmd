@@ -1,0 +1,261 @@
+---
+title: "Assignment 2"
+author: "Enya Liu"
+date: "2025-05-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Read in the dataset
+```{r}
+# read in dataset
+library(readxl)
+data_info <- read_excel("registry_deID Data Dictionary.xlsx")
+registry <- read.csv("registry_deID.csv")
+```
+# Generate the dataset into wide format
+```{r}
+library(tidyverse)
+
+# Assume df is your input data
+# Pivot to long format
+registry_long <- registry %>%
+  pivot_longer(cols = starts_with("vx"),
+               names_to = "drug",
+               values_to = "on_drug") %>%
+  arrange(newID, stdyrs) %>%
+  group_by(newID, stdyrs) %>%
+  mutate(on_drug = ifelse(is.na(on_drug), 0, 1))
+
+# keep one value for each newID and stdyrs. 
+# if no drug taken then 0, else return the drug name
+registry_edited <- registry_long %>%
+  group_by(newID, stdyrs) %>%
+  summarise(output = if (all(on_drug == 0)) {
+    list(0)
+  } else {
+    list(drug[on_drug == 1])
+  }, .groups = "drop")
+
+# separate c("vx661comb", "vx445comb") into two rows
+registry_edited <- registry_edited %>%
+  mutate(output = as.character(output)) %>%
+  mutate(output = gsub("^c\\(|\\)$", "", output)) %>% 
+  mutate(output = gsub("\"", "", output)) %>%
+  mutate(output = strsplit(output, ",")) %>%                # Split by comma
+  unnest(output) %>%
+  mutate(output = trimws(output))                           # Remove leading/trailing spaces   
+registry_edited
+```
+
+# Identify consecutive segments of the same drug
+
+```{r}
+library(dplyr)
+library(data.table)  # for rleid
+
+start_end_date <- registry_edited %>%
+  arrange(newID, stdyrs) %>%
+  group_by(newID) %>%
+  mutate(segment_id = rleid(output)) %>%
+  group_by(newID, output, segment_id) %>%
+  summarise(
+    start_time = min(stdyrs),
+    end_time = max(stdyrs),
+    .groups = "drop"
+  )
+
+# remove the first enc and last enc date
+start_end_date <- start_end_date %>%
+  group_by(newID) %>%
+  arrange(start_time) %>%
+  filter(!(row_number() == 1 & output == "0"),
+         !(row_number() == n() & output == "0")) %>%
+  ungroup()
+
+start_end_date
+```
+# Start to detect for gaps in drug usage 
+```{r}
+# store no gap data in consecutive_data
+consective_data <- start_end_date %>%
+  group_by(newID) %>%
+  filter(!any(duplicated(output))) %>%
+  ungroup()
+# store non consecutive data in gap_data
+gap_data <- start_end_date %>%
+  group_by(newID) %>%
+  arrange(start_time) %>%
+  filter(any(duplicated(output))) %>%
+  ungroup()
+
+# Arrange by newID, start time
+gap_sorted <- gap_data[order(gap_data$newID, gap_data$start_time), ]
+
+for (i in 1:(nrow(gap_sorted)-2)) {
+
+  if (gap_sorted$newID[i] == gap_sorted$newID[i+2] && gap_sorted$output[i] == gap_sorted$output[i+2] &&
+      gap_sorted$start_time[i] != gap_sorted$start_time[i+2] && gap_sorted$output[i] != 0) {
+    gap_sorted$start_date[i] <- gap_sorted$end_time[i]
+    gap_sorted$stop_date[i] <- gap_sorted$start_time[i+2]
+    gap_sorted$gap_dur[i] <- gap_sorted$start_time[i+2] - gap_sorted$end_time[i]
+    gap_sorted$gap_enc[i] <- 1
+    gap_sorted$gap_mod[i] <- ifelse(gap_sorted$output[i+1] == 0, 0,1)
+  }
+  else{
+    gap_sorted$start_date[i] <- NA
+    gap_sorted$stop_date[i] <- NA
+    gap_sorted$gap_dur[i] <- NA
+    gap_sorted$gap_enc[i] <- NA
+    gap_sorted$gap_mod[i] <- NA
+  }
+}
+
+gap_result <- gap_sorted %>%
+  select(1,2,6,7,8,9,10) %>%
+  na.omit()
+
+# combine consecutive and non consecutive datasets
+consective_data <- rename(consective_data, start_date = start_time, stop_date = end_time)
+combined <- bind_rows(gap_result, consective_data[,c(1,2,4,5)])
+combined
+```
+# Reshape into wide format
+```{r}
+test <- combined %>%
+  group_by(newID, output) %>%
+  mutate(gap_num = row_number()) %>%
+  pivot_wider(
+    names_from = gap_num,
+    values_from = c(start_date, stop_date, gap_dur,gap_enc,gap_mod),
+    names_sep = "_"
+  )
+```
+
+# Reference code from Morgan
+```{r}
+library(tidyverse)
+library(stringr)
+library(magrittr)
+
+DF <- read.csv("registry_deID.csv")
+# DF is the registry_deID.csv dataset 
+DF %<>% 
+  # I want to perform some mutations within a given subject, so I 
+  # chose to group by subject
+  dplyr::group_by(newID) %>%
+  # The mutations that follow create the following variables:
+  #   - next_date: The next encounter date from the registry for the given subject
+  #   - Vx770_num: The number of times Vx770 was started for a given subject. 
+  #                For instance, if a participant starts Vx770 for the first time, 
+  #                Vx770_num == 1. However, if they stop it and restart at a later 
+  #                date, then Vx770_num == 2 at the point at which they restart.
+  #                Note that the value of Vx770_num continues until the subject
+  #                restarts Vx770, even if they are no longer presribed Vx770;
+  #                this will help us get the values in which we are interested.
+  #   - Vx809comb_num: Same as Vx770_num, but for Vx809comb.
+  #   - vx661comb_num: Same as Vx770_num, but for vx661comb.
+  #   - vx445comb_num: Same as Vx770_num, but for vx445comb.
+  dplyr::mutate(next_date = lead(stdyrs),
+                # The two lines of code below are a quick and dirty way to number
+                # Vx770_num the way described above. But only periods on treatment
+                # are numbered.
+                Vx770_num = cumsum(is.na(Vx770)) * (is.na(Vx770) == 0),
+                Vx770_num = as.numeric(factor(Vx770_num, 
+                                              levels = unique(Vx770_num)[-which(unique(Vx770_num) == 0)],
+                                              ordered = TRUE)),
+                Vx809comb_num = cumsum(is.na(Vx809comb)) * (is.na(Vx809comb) == 0),
+                Vx809comb_num = as.numeric(factor(Vx809comb_num, 
+                                              levels = unique(Vx809comb_num)[-which(unique(Vx809comb_num) == 0)],
+                                              ordered = TRUE)),
+                vx661comb_num = cumsum(is.na(vx661comb)) * (is.na(vx661comb) == 0),
+                vx661comb_num = as.numeric(factor(vx661comb_num, 
+                                              levels = unique(vx661comb_num)[-which(unique(vx661comb_num) == 0)],
+                                              ordered = TRUE)),
+                vx445comb_num = cumsum(is.na(vx445comb)) * (is.na(vx445comb) == 0),
+                vx445comb_num = as.numeric(factor(vx445comb_num, 
+                                              levels = unique(vx445comb_num)[-which(unique(vx445comb_num) == 0)],
+                                              ordered = TRUE))) %>%
+  # This code carries the value of Vx770_num down through the gaps until
+  # Vx770 is restarted.
+  tidyr::fill(Vx770_num, .direction = "down") %>% # e.g. 1 2 NA NA 2 5 -> 1 2 2 2 2 5
+  tidyr::fill(Vx809comb_num, .direction = "down") %>%
+  tidyr::fill(vx661comb_num, .direction = "down") %>%
+  tidyr::fill(vx445comb_num, .direction = "down") %>%
+  dplyr::ungroup() %>%
+  # Reordering of variables in preparation for pivot_longer
+  dplyr::select(newID, stdyrs, next_date, 
+                Vx770, Vx770_num,
+                Vx809comb, Vx809comb_num,
+                vx661comb, vx661comb_num,
+                vx445comb, vx445comb_num) %>%
+  # Renaming of variables to make pivot_longer easier
+  dplyr::rename(Vx770_tx = "Vx770",
+                Vx809comb_tx = "Vx809comb",
+                vx661comb_tx = "vx661comb",
+                vx445comb_tx = "vx445comb") %>%
+  # Makes the data long format with three columns:
+  #   - cftr_mod: CFTR modulators
+  #   - tx: Was the participant treated at the time with the corresponding cftr_mod (Yes == 1).
+  #   - num: How many times has the participant started/restarted the cftr_mod (NA == 0).
+  tidyr::pivot_longer(cols = Vx770_tx:vx445comb_num,
+                      names_pattern = c("(.*)_(.*)"),
+                      names_to = c("cftr_mod", ".value")) %>%
+  # I want to determine if a given participant is on any modulator at a given time,
+  # so I am going to group by subject and dates to define the following variable:
+  #   - txed: Is the participant treated with a modulator (1 = Yes)
+  dplyr::group_by(newID, stdyrs) %>%
+  dplyr::mutate(txed = ifelse(sum(is.na(tx) == 0) > 0, 1, 0)) %>%
+  dplyr::ungroup() %>%
+  # To help with calculations later, I want to define two versions of the dates:
+  #   - date: If a participant is on cftr_mod, date == stdyrs. Otherwise it's NA.
+  #   - nodate: If a participant is off cftr_mod, nodate == stdyrs and NA otherwise.
+  dplyr::mutate(date = ifelse(is.na(tx) == 0, stdyrs, NA),
+                nodate = ifelse(is.na(tx) == 1, stdyrs, NA)) %>%
+  # This removes treatments a participant has never started before a given date.
+  dplyr::filter(is.na(num) == 0) %>%
+  # The code below helps us generate the variables in which we are interested. We
+  # first group by subject, cftr_mod, and num to get the data associated with each
+  # instance a participant started then stopped a cftr_mod, as well as the gap afterward.
+  # The variables to be created are:
+  #   - start_date: date a modulator was started (or restarted)
+  #   - stop_date: first date after started (or restarted) that the participant was
+  #                reported as not being prescribed the cftr_mod OR the last date
+  #                the participant is reported being on cftr_mod if no additional
+  #                data are available.
+  #   - gap_dur: Time from the first instance the participant is not listed as 
+  #              being prescribed cftr_mod and the next start_date for the restart
+  #              of cftr_mod OR the last date recorded for the participant.
+  #   - gap_enc: number of encounters for which the participant is listed as not
+  #              being prescribed cftr_mod after stopping until restarting, if
+  #              applicable.
+  #   - gap_mod: Indicates that the participant was treated with another modulator
+  #              during the gap.
+  dplyr::group_by(newID, cftr_mod, num) %>%
+  dplyr::summarize(start_date = min(date, na.rm = TRUE),
+                   stop_date = ifelse(sum(is.na(tx) == 1) == 0, 
+                                      max(date, na.rm = TRUE),
+                                      min(nodate, na.rm = TRUE)),
+                   gap_dur = ifelse(sum(is.na(tx) == 1) > 0,
+                                    max(next_date, na.rm = TRUE) - min(nodate, na.rm = TRUE),
+                                    0),
+                   gap_enc = sum(is.na(tx)),
+                   gap_mod = ifelse(sum(is.na(tx) == 1 & txed == 1) > 0, 1, 0)) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(newID, start_date) %>%
+  # Transforms the data to wide format.
+  tidyr::pivot_wider(names_from = num, 
+                     names_sep = "_",
+                     values_from = c(start_date, stop_date, gap_dur, gap_enc, gap_mod))
+
+# Reorders the data so that the start/stop dates and gap information for the first
+# instance a participant was on cftr_mod is first followed by 2nd, 3rd, and so on.
+DF %<>%
+  dplyr::select(str_order(str_extract(names(DF), "\\d+$"), numeric = T, na_last = F))
+  
+write.csv(DF, "Registry_tx_dates.csv")
+```
+
