@@ -1,0 +1,244 @@
+---
+title: "Assignment 5"
+author: "Enya Liu"
+date: "2026-02-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(survival)
+library(survminer)
+chec <- read.csv("chec_mod_merged_2.csv")
+reg <- read.csv("registry_deID.csv")
+```
+
+```{r}
+# case_when() checks conditions from top to bottom, and it stops at the first TRUE condition for each row.
+modsurv <- chec[,c(2,3)]
+max_stdyrs <- reg %>%
+  group_by(newID) %>%
+  summarise(stop = max(stdyrs, na.rm = TRUE), .groups = "drop")
+modsurv <- modsurv %>%
+  left_join(max_stdyrs, by = c("newid" = "newID"))
+
+# check rules for TStart and TStop
+modsurv$TStart <- chec$chec_min_start
+modsurv$TStop <- case_when(
+    is.na(chec$chec_max_stop)== 0 ~ chec$chec_max_stop,
+    is.na(chec$chec_max_stop)== 1 & is.na(chec$expanded_stop) == 0 ~ chec$expanded_stop,
+    is.na(chec$chec_max_stop)== 1 & is.na(chec$expanded_stop) == 1 & modsurv$stop < chec$swdt ~ 0,
+    is.na(chec$chec_max_stop)== 1 & is.na(chec$expanded_stop) == 1 ~ modsurv$stop
+  ) # 4406 is a special case where modsurv$stop < chec$swdt
+
+# check rules for event
+modsurv$event <- case_when(
+    is.na(chec$chec_max_stop)== 0 | is.na(chec$expanded_stop) == 0 ~ 1,
+    is.na(chec$chec_max_stop)== 1 & is.na(chec$expanded_stop) == 1 ~ 0
+  ) # 4667 is a special case with TSop from max(stdyrs) but event = 0
+
+# drop the max(stdyrs) row from modsurv
+modsurv <- modsurv[,-3]
+```
+
+# Q1-Q4
+```{r}
+modsurv2 <- modsurv %>%
+  rowwise() %>%
+  mutate(
+    # pull this person's encounter times
+    enc = list(reg$stdyrs[reg$newID == newid]),
+
+    # define t0 (modulator initiation time)
+    t0 = TStart,
+
+    # count encounters in each quarter within the prior year
+    Q1 = sum(enc >=  t0 - 0.25 & enc <= t0, na.rm = TRUE),
+    Q2 = sum(enc >=  t0 - 0.50 & enc < t0 - 0.25, na.rm = TRUE),
+    Q3 = sum(enc >=  t0 - 0.75 & enc < t0 - 0.50, na.rm = TRUE),
+    Q4 = sum(enc >=  t0 - 1.00 & enc <= t0 - 0.75, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  select(-enc, -t0)
+
+write.csv(modsurv2, "ModSurv.csv")
+```
+
+# KM Curve
+```{r}
+df_km <- modsurv2 %>%
+  mutate(
+    fu_time = TStop - TStart,                 # duration of follow-up
+    status  = as.integer(event == 1)          # 1=event, 0=right-censored
+  ) %>%
+  filter(!is.na(fu_time), fu_time >= 0, !is.na(status), !is.na(cftr_mod))
+
+fit <- survfit(Surv(fu_time, status) ~ cftr_mod, data = df_km)
+
+ggsurvplot(
+  fit,
+  data = df_km,
+  conf.int = TRUE,
+  pval = TRUE
+)
+```
+
+# Median survival + 95% CI
+```{r}
+summary(fit)$table[, c("median", "0.95LCL", "0.95UCL")]
+```
+# Summary table
+```{r}
+fit_overall <- survfit(Surv(fu_time, status) ~ 1, data = df_km)
+plot(fit_overall, xlab = "Time", ylab = "Survival probability")
+quantile(fit_overall, probs = 0.5)
+
+n_distinct(modsurv2$newid) 
+n_distinct(modsurv[modsurv2$cftr_mod == "Ivacaftor",]$newid) 
+n_distinct(modsurv[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor",]$newid) 
+n_distinct(modsurv[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor",]$newid) 
+n_distinct(modsurv[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor",]$newid)
+
+nrow(modsurv2[modsurv2$event==0,])
+nrow(modsurv[modsurv2$cftr_mod == "Ivacaftor"&modsurv2$event==0,]) 
+nrow(modsurv[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor"&modsurv2$event==0,])
+nrow(modsurv[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor"&modsurv2$event==0,])
+nrow(modsurv[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor"&modsurv2$event==0,])
+
+nrow(modsurv2[modsurv2$event==1,])
+nrow(modsurv[modsurv2$cftr_mod == "Ivacaftor"&modsurv2$event==1,]) 
+nrow(modsurv[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor"&modsurv2$event==1,])
+nrow(modsurv[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor"&modsurv2$event==1,])
+nrow(modsurv[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor"&modsurv2$event==1,])
+```
+# Summarizing Pre-Modulator Data Availability
+```{r}
+# at least 1 enc overall
+n_distinct(modsurv2[modsurv2$cftr_mod == "Ivacaftor" & (modsurv2$Q1>0|modsurv2$Q2>0|modsurv2$Q3>0|modsurv2$Q4>0),]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor" & (modsurv2$Q1>0|modsurv2$Q2>0|modsurv2$Q3>0|modsurv2$Q4>0),]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor" & (modsurv2$Q1>0|modsurv2$Q2>0|modsurv2$Q3>0|modsurv2$Q4>0),]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor" & (modsurv2$Q1>0|modsurv2$Q2>0|modsurv2$Q3>0|modsurv2$Q4>0),]$newid) 
+
+# Q1 > 0
+n_distinct(modsurv2[modsurv2$cftr_mod == "Ivacaftor" & modsurv2$Q1>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor" & modsurv2$Q1>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor" & modsurv2$Q1>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor" & modsurv2$Q1>0,]$newid) 
+
+# Q2 > 0
+n_distinct(modsurv2[modsurv2$cftr_mod == "Ivacaftor" & modsurv2$Q2>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor" & modsurv2$Q2>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor" & modsurv2$Q2>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor" & modsurv2$Q2>0,]$newid) 
+
+# Q3 > 0
+n_distinct(modsurv2[modsurv2$cftr_mod == "Ivacaftor" & modsurv2$Q3>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor" & modsurv2$Q3>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor" & modsurv2$Q3>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor" & modsurv2$Q3>0,]$newid) 
+
+# Q4 > 0
+n_distinct(modsurv2[modsurv2$cftr_mod == "Ivacaftor" & modsurv2$Q4>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor" & modsurv2$Q4>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor" & modsurv2$Q4>0,]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor" & modsurv2$Q4>0,]$newid) 
+
+###### Avg enc #####
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Ivacaftor", c("Q1","Q2","Q3","Q4")],
+          na.rm = TRUE)
+)/548
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor", c("Q1","Q2","Q3","Q4")],
+          na.rm = TRUE)
+)/770
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor", c("Q1","Q2","Q3","Q4")],
+          na.rm = TRUE)
+)/683
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor", c("Q1","Q2","Q3","Q4")],
+          na.rm = TRUE)
+)/2190
+
+# Q1
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Ivacaftor", c("Q1")],
+          na.rm = TRUE)
+)/490
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor", c("Q1")],
+          na.rm = TRUE)
+)/701
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor", c("Q1")],
+          na.rm = TRUE)
+)/619
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor", c("Q1")],
+          na.rm = TRUE)
+)/1901
+# Q2
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Ivacaftor", c("Q2")],
+          na.rm = TRUE)
+)/440
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor", c("Q2")],
+          na.rm = TRUE)
+)/690
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor", c("Q2")],
+          na.rm = TRUE)
+)/586
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor", c("Q2")],
+          na.rm = TRUE)
+)/1799
+# Q3
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Ivacaftor", c("Q3")],
+          na.rm = TRUE)
+)/424
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor", c("Q3")],
+          na.rm = TRUE)
+)/672
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor", c("Q3")],
+          na.rm = TRUE)
+)/571
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor", c("Q3")],
+          na.rm = TRUE)
+)/1800
+# Q4
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Ivacaftor", c("Q4")],
+          na.rm = TRUE)
+)/419
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor", c("Q4")],
+          na.rm = TRUE)
+)/668
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor", c("Q4")],
+          na.rm = TRUE)
+)/585
+sum(
+  rowSums(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor", c("Q4")],
+          na.rm = TRUE)
+)/1775
+
+# at least 1 enc in every mod
+n_distinct(modsurv2[modsurv2$cftr_mod == "Ivacaftor" & (modsurv2$Q1>0&modsurv2$Q2>0&modsurv2$Q3>0&modsurv2$Q4>0),]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Lumacaftor / Ivacaftor" & (modsurv2$Q1>0&modsurv2$Q2>0&modsurv2$Q3>0&modsurv2$Q4>0),]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Tezacaftor / Ivacaftor" & (modsurv2$Q1>0&modsurv2$Q2>0&modsurv2$Q3>0&modsurv2$Q4>0),]$newid) 
+n_distinct(modsurv2[modsurv2$cftr_mod == "Elexacaftor / Tezacaftor / Ivacaftor" & (modsurv2$Q1>0&modsurv2$Q2>0&modsurv2$Q3>0&modsurv2$Q4>0),]$newid) 
+```
+
+
