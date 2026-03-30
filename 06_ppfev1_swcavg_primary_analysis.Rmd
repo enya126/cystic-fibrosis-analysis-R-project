@@ -1,0 +1,259 @@
+---
+title: "Assignment 6"
+author: "Enya Liu"
+date: "2026-03-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(nlme)
+library(lmerTest)
+library(geepack)
+swdt <- read.csv("chec_swdt.csv")
+modsurv <- read.csv("ModSurv.csv")
+registry <- read.csv("registry_deID.csv")
+```
+
+# Data Processing
+```{r}
+# merge datasets
+merged_modsurv <- modsurv[,2:5] %>%
+  left_join(registry[,c(1,2,7)], by = c("newid" = "newID"))
+
+# filter interested data
+merged_modsurv <- merged_modsurv[merged_modsurv$TStart <= merged_modsurv$stdyrs & merged_modsurv$stdyrs <= merged_modsurv$TStop, ]
+
+# compute a time variable
+merged_modsurv$Time <- merged_modsurv$stdyrs - merged_modsurv$TStart
+
+merged_modsurv <- merged_modsurv %>%
+  left_join(swdt[,c(2,3,5)], by = c("newid", "cftr_mod"))
+```
+
+# Analysis of Interest
+We are interested in determining the relationship between sweat chloride concentration (swcavg) and the rate of change per year in the ppFEV1 (ppfev). The hypothesis is that there is a non-linear relationship between sweat chloride concentration and the rate of change per year in the ppFEV1. 
+```{r}
+sampled_data <- merged_modsurv %>%
+  filter(newid %in% sample(unique(newid), 100))
+
+ggplot(sampled_data, 
+       aes(x = Time, y = fevpp, group = newid, color = swcavg)) +
+  geom_line(alpha = 0.3)
+```
+
+```{r}
+ggplot(merged_modsurv, aes(Time, fevpp)) +
+  geom_smooth(se = FALSE)
+```
+
+# LMM: comparing random intercept vs random intercept & random slope
+```{r}
+lmm_mod <- lmer(fevpp ~ Time * swcavg + cftr_mod + (Time | newid), data = merged_modsurv, REML = FALSE) # random intercept + slope
+lmm_mod_int <- lmer(fevpp ~ Time * swcavg + cftr_mod + (1 | newid), data = merged_modsurv, REML = FALSE) # random intercept
+
+anova(lmm_mod_int, lmm_mod)
+```
+We fitted a linear mixed-effects model with random intercepts and slopes to account for within-patient correlation in repeated ppFEV1 measurements. 
+REML criterion at convergence is extremely large, indicating that this might not be a good model fit. 
+Extremely large scaled residuals, indicating outliers and possible non-normality. 
+
+# Spline Linear Mixed Model
+```{r}
+lmm_spline <- lmer(fevpp ~ splines::ns(Time, 3) * swcavg + cftr_mod + (Time || newid),
+              data = merged_modsurv, REML = FALSE)
+summary(lmm_spline)
+anova(lmm_mod, lmm_spline)
+```
+When we estimate the correlation between random intercept (baseline) and random slope (for Time) across patients, the model does not converge, so we did not estimate the correlation in our spline LMM. 
+
+# Centered spline lmm
+```{r}
+merged_modsurv <- merged_modsurv |>
+  dplyr::mutate(
+    Time_c = as.numeric(scale(Time, center = TRUE, scale = FALSE)),
+    swcavg_c = as.numeric(scale(swcavg, center = TRUE, scale = FALSE))
+  )
+
+model_c3 <- lmer(
+  fevpp ~ splines::ns(Time_c, 3) * swcavg_c + cftr_mod +
+    ((1 | newid) + (0 + Time_c | newid)),
+  data = merged_modsurv, REML = FALSE
+)
+
+model_c3_reduced <- lmer(
+  fevpp ~ splines::ns(Time_c, 3) + swcavg_c + cftr_mod +
+    ((1 | newid) + (0 + Time_c | newid)),
+  data = merged_modsurv, REML = FALSE
+)
+summary(model_c3)
+anova(model_c3_reduced, model_c3)
+```
+By using a spline lmm, we are modeling the nonlinear relationship between time and ppfev1, as well as time-varying effect of swcavg on ppFEV1. i.e. the association between swcavg and ppfev1 is allowed to change over time nonlinearly. 
+
+We modeled ppFEV1 longitudinally using a linear mixed-effects model with a natural cubic spline for time, allowing the average ppFEV1 trajectory to be nonlinear. Baseline sweat chloride concentration was included as a subject-level predictor, along with its interaction with spline-transformed time, to assess whether the association between sweat chloride and lung function varies over follow-up. Subject-specific random intercepts and linear slopes were included to account for within-patient correlation and heterogeneity in baseline lung function and rate of change.
+
+At the mean follow-up time, a 1-unit increase in sweat chloride is associated with a 0.027 decrease in ppFEV1, and this association varies over time.
+
+# Model diagnostic
+```{r}
+vars <- c("fevpp", "Time_c", "swcavg_c", "cftr_mod", "newid")
+
+data_clean <- merged_modsurv %>%
+  drop_na(all_of(vars))
+## Residuals
+pop.res <- resid(model_c3)
+
+## For lmer, conditional residuals are the default residuals
+cluster.res <- resid(model_c3)
+
+## Predicted subject specific random intercepts and slopes
+bi <- coef(model_c3)$newid
+colnames(bi) <- c("Random_Intercept", "Random_Slope_Time_c")
+
+## Predicted subject specific and population-level response profiles
+data_clean$pred.model_c3_marg <- predict(model_c3, re.form = NA)
+data_clean$pred.model_c3_cond <- predict(model_c3, re.form = NULL)
+
+## Plots
+par(mfrow = c(1, 2))
+plot(data_clean$pred.model_c3_marg, pop.res,
+     ylab = "Population-level residuals",
+     xlab = "Predicted (population-level)",
+     main = "Residuals vs\nPredicted Mean Response")
+lines(lowess(data_clean$pred.model_c3_marg, pop.res), col = "red")
+qqnorm(pop.res, main = "QQ Plot: Residuals")
+qqline(pop.res)
+
+par(mfrow = c(1, 2))
+plot(data_clean$swcavg_c, cluster.res,
+     xlab = "swcavg_c",
+     ylab = "Conditional residuals",
+     main = "Residuals vs swcavg_c")
+lines(lowess(data_clean$swcavg_c, cluster.res), col = "red")
+
+plot(data_clean$Time_c, cluster.res,
+     xlab = "Time_c",
+     ylab = "Conditional residuals",
+     main = "Residuals vs Time_c")
+lines(lowess(data_clean$Time_c, cluster.res), col = "red")
+
+par(mfrow = c(1, 2))
+qqnorm(bi[, 1], main = "QQ Plot: Random Intercepts")
+qqline(bi[, 1])
+
+qqnorm(bi[, 2], main = "QQ Plot: Random Slopes")
+qqline(bi[, 2])
+```
+The mean structure is correctly specified, centered around mean = 0, and the residuals are uncorrelated according to the residuals vs Time plot and the variogram. 
+Diagnostic plots suggest violations of the constant variance and normality assumptions. The residuals exhibit heteroscedasticity and heavy tails, which are common in large longitudinal datasets. Given the large sample size and the focus on fixed-effect estimation, these deviations are unlikely to substantially affect inference, but they suggest that variance modeling or robust approaches could be considered.
+
+## Variogram
+```{r}
+dat_vario <- data_clean %>%
+  mutate(resid_cond = resid(model_c3))
+
+variogram_df <- dat_vario %>%
+  arrange(newid, Time_c) %>%
+  group_by(newid) %>%
+  group_modify(~{
+    df <- .x
+    n <- nrow(df)
+    if (n < 2) return(tibble())
+
+    idx <- utils::combn(n, 2)
+
+    tibble(
+      lag = abs(df$Time_c[idx[1, ]] - df$Time_c[idx[2, ]]),
+      semivariance = 0.5 * (df$resid_cond[idx[1, ]] - df$resid_cond[idx[2, ]])^2
+    )
+  }) %>%
+  ungroup()
+
+ggplot(variogram_df, aes(x = lag, y = semivariance)) +
+  geom_point(alpha = 0.03) +
+  geom_smooth(se = FALSE) +
+  labs(
+    x = "Time lag",
+    y = "Semivariance",
+    title = "Empirical variogram from lmer residuals"
+  ) +
+  theme_minimal()
+```
+
+
+# Diagnostic: observed vs predicted
+```{r}
+## Predicted values
+data_clean$pred.model_c3_marg <- predict(model_c3, re.form = NA)
+data_clean$pred.model_c3_cond <- predict(model_c3, re.form = NULL)
+ggplot(data_clean, aes(x = Time)) +
+  geom_smooth(aes(y = fevpp, color = "Observed"), se = FALSE, linewidth = 1.2) +
+  geom_smooth(aes(y = pred.model_c3_marg, color = "Predicted (marginal)"),
+              se = FALSE, linewidth = 1.2, linetype = 2) +
+  geom_smooth(aes(y = pred.model_c3_cond, color = "Predicted (conditional)"),
+              se = FALSE, linewidth = 1.2, linetype = 3) +
+  labs(
+    x = "Time",
+    y = "ppFEV1",
+    color = "",
+    title = "Observed vs Predicted Trajectories",
+    subtitle = "Solid = observed, dashed = marginal prediction, dotted = conditional prediction"
+  )
+```
+Marginal prediction = only fixed effects, population-level trajectory
+Conditional prediction = includes subject-specific random effects
+
+The discrepancy between marginal and conditional predictions indicates substantial heterogeneity in both baseline ppFEV1 and longitudinal change. While the population-average trajectory appears smoother and attenuated, the subject-specific predictions closely align with observed data, supporting the inclusion of random intercepts and slopes in the model.
+
+```{r}
+data_clean <- data_clean %>%
+  mutate(
+    swc_group = cut(
+      swcavg_c,
+      breaks = quantile(swcavg_c, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+      include.lowest = TRUE,
+      labels = c("Low swcavg", "Medium swcavg", "High swcavg")
+    )
+  )
+
+ggplot(data_clean, aes(x = Time)) +
+  geom_smooth(aes(y = fevpp), se = FALSE, color = "black") +
+  geom_smooth(aes(y = pred), se = FALSE, color = "red", linetype = 2) +
+  facet_wrap(~ swc_group) +
+  labs(
+    x = "Time",
+    y = "ppFEV1",
+    title = "Observed vs predicted trajectories by sweat chloride group",
+    subtitle = "Black = observed smooth, Red dashed = predicted smooth"
+  ) +
+  theme_minimal()
+```
+
+
+# Snesitivity analysis with GEE
+Given the presence of heteroscedasticity and deviations from normality in the residual diagnostics, GEE was used as a sensitivity analysis to assess the robustness of the findings. Unlike LMM, GEE does not rely on full distributional assumptions and provides consistent estimates with robust standard errors. The consistency of results across LMM and GEE supports the validity of the observed association.
+
+LMM asks: how do trajectories differ across patients, allowing patient-specific intercepts/slopes?
+GEE asks: what is the average association in the population, accounting for within-patient correlation?
+```{r}
+# corstr: models correlation of repeated measurements within the same patient
+gee_spline <- geeglm(
+  fevpp ~ splines::ns(Time_c, 3) * swcavg_c + cftr_mod,
+  id = newid,
+  data = merged_modsurv,
+  family = gaussian,
+  corstr = "ar1" # correlation decays over time
+)
+
+summary(gee_spline)
+```
+The GEE results were qualitatively consistent with the LMM findings, with significant nonlinear time effects and time-varying associations between sweat chloride and ppFEV1. Because GEE provides population-averaged estimates with robust standard errors, this consistency suggests that the observed association is not sensitive to assumptions about the random-effects distribution or variance structure.
+
